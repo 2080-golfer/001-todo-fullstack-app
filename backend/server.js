@@ -10,7 +10,30 @@ app.use(express.json());
 
 // GET all todos
 app.get('/api/todos', (req, res) => {
-  db.all('SELECT * FROM todos ORDER BY created_at DESC', [], (err, rows) => {
+  const { sortBy } = req.query;
+
+  let orderClause = 'ORDER BY order_index ASC, created_at DESC';
+
+  if (sortBy === 'priority') {
+    orderClause = `ORDER BY
+      CASE priority
+        WHEN 'high' THEN 1
+        WHEN 'mid' THEN 2
+        WHEN 'low' THEN 3
+        ELSE 4
+      END,
+      order_index ASC`;
+  } else if (sortBy === 'dueDate') {
+    orderClause = `ORDER BY
+      CASE
+        WHEN due_date IS NULL THEN 1
+        ELSE 0
+      END,
+      due_date ASC,
+      order_index ASC`;
+  }
+
+  db.all(`SELECT * FROM todos ${orderClause}`, [], (err, rows) => {
     if (err) {
       return res.status(500).json({ error: err.message });
     }
@@ -20,34 +43,43 @@ app.get('/api/todos', (req, res) => {
 
 // POST create new todo
 app.post('/api/todos', (req, res) => {
-  const { text } = req.body;
+  const { text, priority = 'none', due_date = null } = req.body;
 
   if (!text) {
     return res.status(400).json({ error: 'Text is required' });
   }
 
-  db.run(
-    'INSERT INTO todos (text) VALUES (?)',
-    [text],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: err.message });
-      }
+  // Get the max order_index to add new todo at the end
+  db.get('SELECT MAX(order_index) as maxOrder FROM todos', [], (err, row) => {
+    if (err) {
+      return res.status(500).json({ error: err.message });
+    }
 
-      db.get('SELECT * FROM todos WHERE id = ?', [this.lastID], (err, row) => {
+    const newOrder = (row.maxOrder || 0) + 1;
+
+    db.run(
+      'INSERT INTO todos (text, priority, due_date, order_index) VALUES (?, ?, ?, ?)',
+      [text, priority, due_date, newOrder],
+      function(err) {
         if (err) {
           return res.status(500).json({ error: err.message });
         }
-        res.status(201).json(row);
-      });
-    }
-  );
+
+        db.get('SELECT * FROM todos WHERE id = ?', [this.lastID], (err, row) => {
+          if (err) {
+            return res.status(500).json({ error: err.message });
+          }
+          res.status(201).json(row);
+        });
+      }
+    );
+  });
 });
 
 // PUT update todo
 app.put('/api/todos/:id', (req, res) => {
   const { id } = req.params;
-  const { text, completed } = req.body;
+  const { text, completed, priority, due_date, order_index } = req.body;
 
   let query = 'UPDATE todos SET updated_at = CURRENT_TIMESTAMP';
   const params = [];
@@ -60,6 +92,21 @@ app.put('/api/todos/:id', (req, res) => {
   if (completed !== undefined) {
     query += ', completed = ?';
     params.push(completed ? 1 : 0);
+  }
+
+  if (priority !== undefined) {
+    query += ', priority = ?';
+    params.push(priority);
+  }
+
+  if (due_date !== undefined) {
+    query += ', due_date = ?';
+    params.push(due_date);
+  }
+
+  if (order_index !== undefined) {
+    query += ', order_index = ?';
+    params.push(order_index);
   }
 
   query += ' WHERE id = ?';
@@ -81,6 +128,36 @@ app.put('/api/todos/:id', (req, res) => {
       res.json(row);
     });
   });
+});
+
+// POST reorder todos
+app.post('/api/todos/reorder', (req, res) => {
+  const { todos } = req.body;
+
+  if (!todos || !Array.isArray(todos)) {
+    return res.status(400).json({ error: 'Todos array is required' });
+  }
+
+  const updates = todos.map((todo, index) => {
+    return new Promise((resolve, reject) => {
+      db.run(
+        'UPDATE todos SET order_index = ? WHERE id = ?',
+        [index, todo.id],
+        (err) => {
+          if (err) reject(err);
+          else resolve();
+        }
+      );
+    });
+  });
+
+  Promise.all(updates)
+    .then(() => {
+      res.json({ message: 'Todos reordered successfully' });
+    })
+    .catch((err) => {
+      res.status(500).json({ error: err.message });
+    });
 });
 
 // DELETE todo
